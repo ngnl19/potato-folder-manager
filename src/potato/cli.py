@@ -1,5 +1,22 @@
+from pathlib import Path
 
 import typer
+
+from potato.app import PotatoApp
+
+DEFAULT_ROOT = Path.home()
+
+START_PATH_OPTION = typer.Option(
+    DEFAULT_ROOT,
+    "--path",
+    "-p",
+    exists=True,
+    file_okay=False,
+    dir_okay=True,
+    readable=True,
+    resolve_path=True,
+    help="Starting directory for Potato.",
+)
 
 app = typer.Typer(
     name="potato",
@@ -12,15 +29,12 @@ app = typer.Typer(
 @app.callback()
 def callback() -> None:
     """Manage the Potato CLI."""
-    pass
 
 
 @app.command()
-def start() -> None:
+def start(path: Path = START_PATH_OPTION) -> None:
     """Launch the interactive Potato file browser."""
-    from potato.app import PotatoApp
-
-    PotatoApp().run()
+    PotatoApp(root=path).run()
 
 
 def main() -> None:

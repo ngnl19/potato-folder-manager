@@ -4,6 +4,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 MAX_PREVIEW_BYTES = 64 * 1024
 MAX_SEARCH_DEPTH = 32
@@ -149,13 +150,13 @@ def search_files(
     include_hidden: bool = False,
     max_results: int = MAX_SEARCH_RESULTS,
     max_depth: int = MAX_SEARCH_DEPTH,
+    cancel_event: Event | None = None,
 ) -> list[FileEntry]:
     """
-    Search recursively for filenames matching a substring.
+    Efficient recursive filename search using os.walk.
 
-    Search is case-insensitive and does not follow symbolic links.
-
-    Results are limited by max_results and max_depth.
+    Only matching files are stat'ed. Directory symlinks are
+    excluded and traversal is limited to the configured root.
     """
 
     needle = query.casefold().strip()
@@ -170,65 +171,126 @@ def search_files(
     start = directory.resolve(strict=True)
 
     if not start.is_relative_to(resolved_root):
-        raise PermissionError("Access outside the browsing root is blocked.")
+        raise PermissionError(
+            "Access outside the browsing root is blocked."
+        )
 
     if not start.is_dir():
         raise NotADirectoryError(start)
 
     results: list[FileEntry] = []
 
-    # Each item contains the directory and its depth.
-    stack: list[tuple[Path, int]] = [(start, 0)]
+    def ignore_walk_error(error: OSError) -> None:
+        """Skip inaccessible directories."""
+        return None
 
-    while stack and len(results) < max_results:
-        current, depth = stack.pop()
+    for current_path, dirnames, filenames in os.walk(
+        start,
+        topdown=True,
+        onerror=ignore_walk_error,
+        followlinks=False,
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        current = Path(current_path)
 
         try:
-            with os.scandir(current) as children:
-                for item in children:
-                    try:
-                        if item.is_symlink():
-                            continue
+            # os.walk does not follow directory symlinks here.
+            if not current.is_relative_to(resolved_root):
+                dirnames[:] = []
+                continue
 
-                        if not include_hidden and item.name.startswith("."):
-                            continue
+            depth = len(current.relative_to(start).parts)
 
-                        info = item.stat(follow_symlinks=False)
+        except (OSError, RuntimeError, ValueError):
+            dirnames[:] = []
+            continue
 
-                        is_dir = stat.S_ISDIR(info.st_mode)
-                        is_file = stat.S_ISREG(info.st_mode)
+        safe_directories: list[str] = []
 
-                        if not is_dir and not is_file:
-                            continue
+        # Process directories and prune unwanted traversal.
+        for name in dirnames:
+            if cancel_event is not None and cancel_event.is_set():
+                break
 
-                        path = Path(item.path)
-                        resolved_path = path.resolve(strict=True)
+            if not include_hidden and name.startswith("."):
+                continue
 
-                        if not resolved_path.is_relative_to(resolved_root):
-                            continue
+            candidate = current / name
 
-                        entry = FileEntry(
-                            name=item.name,
-                            path=path,
-                            is_dir=is_dir,
+            try:
+                info = candidate.lstat()
+
+                # lstat identifies symlinks without following them.
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+
+                if needle in name.casefold():
+                    results.append(
+                        FileEntry(
+                            name=name,
+                            path=candidate,
+                            is_dir=True,
                             size=info.st_size,
                             modified=info.st_mtime,
                         )
+                    )
 
-                        if needle in item.name.casefold():
-                            results.append(entry)
+                if len(results) >= max_results:
+                    break
 
-                            if len(results) >= max_results:
-                                break
+                if depth < max_depth:
+                    safe_directories.append(name)
 
-                        if is_dir and depth < max_depth:
-                            stack.append((resolved_path, depth + 1))
+            except (OSError, RuntimeError):
+                continue
 
-                    except (OSError, RuntimeError):
-                        continue
+        dirnames[:] = safe_directories
 
-        except (OSError, RuntimeError):
-            continue
+        if (
+            cancel_event is not None and cancel_event.is_set()
+        ) or len(results) >= max_results:
+            break
+
+        # Only inspect metadata for filenames that match the query.
+        for name in filenames:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            if not include_hidden and name.startswith("."):
+                continue
+
+            if needle not in name.casefold():
+                continue
+
+            candidate = current / name
+
+            try:
+                info = candidate.lstat()
+
+                # Ignore symlinks and special files.
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+
+                results.append(
+                    FileEntry(
+                        name=name,
+                        path=candidate,
+                        is_dir=False,
+                        size=info.st_size,
+                        modified=info.st_mtime,
+                    )
+                )
+
+                if len(results) >= max_results:
+                    break
+
+            except (OSError, RuntimeError):
+                continue
+
+        if len(results) >= max_results:
+            break
 
     return sort_entries(results)
 

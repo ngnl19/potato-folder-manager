@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import grp
 import os
+import pwd
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,271 @@ class FileEntry:
     modified: float
 
 
+@dataclass(frozen=True)
+class FileMetadata:
+    """Read-only filesystem metadata and effective access information."""
+
+    logical_size_bytes: int
+    allocated_size_bytes: int | None
+    mode_octal: str
+    mode_symbolic: str
+    owner_name: str
+    owner_uid: int
+    group_name: str
+    group_gid: int
+    can_read: bool
+    can_write: bool
+    can_execute: bool
+    modified: float
+
+
+@dataclass(frozen=True)
+class DirectorySize:
+    """Recursive size information for directory contents."""
+
+    logical_size_bytes: int
+    allocated_size_bytes: int | None
+    file_count: int
+    directory_count: int
+    errors: int
+
+
+def format_bytes(size: int) -> str:
+    """Format an exact byte count using IEC units."""
+
+    if size < 0:
+        raise ValueError("File size cannot be negative.")
+
+    if size < 1024:
+        unit = "byte" if size == 1 else "bytes"
+        return f"{size:,} {unit}"
+
+    value = float(size)
+
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        value /= 1024
+
+        if value < 1024 or unit == "PiB":
+            return f"{size:,} bytes ({value:.2f} {unit})"
+
+    return f"{size:,} bytes"
+
+
+def _lookup_owner(uid: int) -> str:
+    """Resolve a UID to a username."""
+
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, OSError):
+        return str(uid)
+
+
+def _lookup_group(gid: int) -> str:
+    """Resolve a GID to a group name."""
+
+    try:
+        return grp.getgrgid(gid).gr_name
+    except (KeyError, OSError):
+        return str(gid)
+
+
+def _has_effective_access(path: Path, mode: int) -> bool:
+    """Inspect access for the effective process credentials."""
+
+    if os.access in getattr(os, "supports_effective_ids", set()):
+        return os.access(path, mode, effective_ids=True)
+
+    return os.access(path, mode)
+
+
+def inspect_file(path: Path, root: Path) -> FileMetadata:
+    """Inspect a regular file or directory without changing permissions."""
+
+    resolved_root = canonical_root(root)
+    candidate = Path(path)
+    resolved_path = candidate.resolve(strict=True)
+
+    if not resolved_path.is_relative_to(resolved_root):
+        raise PermissionError("Path is outside the browsing root.")
+
+    info = os.lstat(candidate)
+
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError("Symbolic links cannot be inspected.")
+
+    if not (
+        stat.S_ISREG(info.st_mode)
+        or stat.S_ISDIR(info.st_mode)
+    ):
+        raise ValueError(
+            "Only regular files and directories are supported."
+        )
+
+    allocated_blocks = getattr(info, "st_blocks", None)
+
+    allocated_size = (
+        int(allocated_blocks) * 512
+        if allocated_blocks is not None
+        else None
+    )
+
+    permission_bits = stat.S_IMODE(info.st_mode)
+
+    return FileMetadata(
+        logical_size_bytes=info.st_size,
+        allocated_size_bytes=allocated_size,
+        mode_octal=f"{permission_bits:04o}",
+        mode_symbolic=stat.filemode(info.st_mode),
+        owner_name=_lookup_owner(info.st_uid),
+        owner_uid=info.st_uid,
+        group_name=_lookup_group(info.st_gid),
+        group_gid=info.st_gid,
+        can_read=_has_effective_access(resolved_path, os.R_OK),
+        can_write=_has_effective_access(resolved_path, os.W_OK),
+        can_execute=_has_effective_access(resolved_path, os.X_OK),
+        modified=info.st_mtime,
+    )
+
+
+def calculate_directory_size(
+    directory: Path,
+    root: Path,
+    *,
+    cancel_event: Event | None = None,
+) -> DirectorySize:
+    """
+    Calculate recursive directory contents without reading file contents.
+
+    - Includes hidden files and directories.
+    - Skips symbolic links.
+    - Counts only regular files.
+    - Does not cross the configured root boundary.
+    - Calculates logical and allocated file sizes.
+    - Reports inaccessible entries through the errors field.
+    - Supports cooperative cancellation.
+
+    Allocated size is based on st_blocks * 512 where available.
+    """
+
+    resolved_root = canonical_root(root)
+    start = directory.resolve(strict=True)
+
+    if not start.is_relative_to(resolved_root):
+        raise PermissionError(
+            "Directory is outside the browsing root."
+        )
+
+    if not start.is_dir():
+        raise NotADirectoryError(start)
+
+    logical_size = 0
+    allocated_size = 0
+
+    file_count = 0
+    directory_count = 0
+    errors = 0
+
+    allocated_available = True
+
+    def handle_walk_error(error: OSError) -> None:
+        """Count directories that could not be accessed."""
+
+        nonlocal errors
+        errors += 1
+
+    for current_path, dirnames, filenames in os.walk(
+        start,
+        topdown=True,
+        onerror=handle_walk_error,
+        followlinks=False,
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        current = Path(current_path)
+
+        try:
+            resolved_current = current.resolve(strict=True)
+
+            if not resolved_current.is_relative_to(resolved_root):
+                dirnames[:] = []
+                continue
+
+        except (OSError, RuntimeError):
+            errors += 1
+            dirnames[:] = []
+            continue
+
+        safe_directories: list[str] = []
+
+        # Include hidden directories in the total, regardless of
+        # whether the user currently displays hidden files in Potato.
+        for name in dirnames:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            candidate = current / name
+
+            try:
+                info = candidate.lstat()
+
+                # Exclude symlinks and special filesystem objects.
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+
+                safe_directories.append(name)
+                directory_count += 1
+
+            except (OSError, RuntimeError):
+                errors += 1
+
+        # Only descend into validated directories.
+        dirnames[:] = safe_directories
+
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        # Inspect files and accumulate their actual sizes.
+        for name in filenames:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            candidate = current / name
+
+            try:
+                info = candidate.lstat()
+
+                # Do not count symlinks, sockets, devices, or pipes.
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+
+                logical_size += info.st_size
+                file_count += 1
+
+                blocks = getattr(info, "st_blocks", None)
+
+                if blocks is None:
+                    allocated_available = False
+                else:
+                    allocated_size += blocks * 512
+
+            except (OSError, RuntimeError):
+                errors += 1
+
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+    return DirectorySize(
+        logical_size_bytes=logical_size,
+        allocated_size_bytes=(
+            allocated_size if allocated_available else None
+        ),
+        file_count=file_count,
+        directory_count=directory_count,
+        errors=errors,
+    )
+
+
 def canonical_root(root: Path) -> Path:
     """Resolve and validate the permitted browsing root."""
 
@@ -34,7 +301,7 @@ def canonical_root(root: Path) -> Path:
 
 
 def is_within_root(path: Path, root: Path) -> bool:
-    """Check whether an existing path resolves inside the browsing root."""
+    """Check whether a path resolves inside the browsing root."""
 
     try:
         resolved_root = canonical_root(root)
@@ -53,10 +320,7 @@ def sort_entries(
     """Sort directories first, followed by files."""
 
     def name_key(entry: FileEntry) -> tuple[bool, str]:
-        return (
-            not entry.is_dir,
-            entry.name.casefold(),
-        )
+        return not entry.is_dir, entry.name.casefold()
 
     def size_key(entry: FileEntry) -> tuple[bool, int, str]:
         return (
@@ -96,7 +360,9 @@ def list_directory(
     current = directory.resolve(strict=True)
 
     if not current.is_relative_to(resolved_root):
-        raise PermissionError("Access outside the browsing root is blocked.")
+        raise PermissionError(
+            "Access outside the browsing root is blocked."
+        )
 
     if not current.is_dir():
         raise NotADirectoryError(current)
@@ -152,12 +418,7 @@ def search_files(
     max_depth: int = MAX_SEARCH_DEPTH,
     cancel_event: Event | None = None,
 ) -> list[FileEntry]:
-    """
-    Efficient recursive filename search using os.walk.
-
-    Only matching files are stat'ed. Directory symlinks are
-    excluded and traversal is limited to the configured root.
-    """
+    """Recursively search filenames using os.walk."""
 
     needle = query.casefold().strip()
 
@@ -181,7 +442,6 @@ def search_files(
     results: list[FileEntry] = []
 
     def ignore_walk_error(error: OSError) -> None:
-        """Skip inaccessible directories."""
         return None
 
     for current_path, dirnames, filenames in os.walk(
@@ -196,8 +456,9 @@ def search_files(
         current = Path(current_path)
 
         try:
-            # os.walk does not follow directory symlinks here.
-            if not current.is_relative_to(resolved_root):
+            resolved_current = current.resolve(strict=True)
+
+            if not resolved_current.is_relative_to(resolved_root):
                 dirnames[:] = []
                 continue
 
@@ -209,7 +470,6 @@ def search_files(
 
         safe_directories: list[str] = []
 
-        # Process directories and prune unwanted traversal.
         for name in dirnames:
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -222,7 +482,6 @@ def search_files(
             try:
                 info = candidate.lstat()
 
-                # lstat identifies symlinks without following them.
                 if not stat.S_ISDIR(info.st_mode):
                     continue
 
@@ -253,7 +512,6 @@ def search_files(
         ) or len(results) >= max_results:
             break
 
-        # Only inspect metadata for filenames that match the query.
         for name in filenames:
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -269,7 +527,6 @@ def search_files(
             try:
                 info = candidate.lstat()
 
-                # Ignore symlinks and special files.
                 if not stat.S_ISREG(info.st_mode):
                     continue
 
@@ -316,7 +573,9 @@ def read_preview(path: Path, root: Path) -> tuple[str, bool]:
             info = os.fstat(file.fileno())
 
             if not stat.S_ISREG(info.st_mode):
-                raise ValueError("Only regular files can be previewed.")
+                raise ValueError(
+                    "Only regular files can be previewed."
+                )
 
             data = file.read(MAX_PREVIEW_BYTES + 1)
 

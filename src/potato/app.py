@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +20,13 @@ from potato.destination_picker import (
     DirectoryPicker,
     ManualPathRequest,
 )
-from potato.operations import copy_path, move_path, rename_path
+from potato.operations import (
+    OperationCancelled,
+    OperationProgress,
+    copy_path,
+    move_path,
+    rename_path,
+)
 from potato.security import (
     DirectorySize,
     FileEntry,
@@ -121,11 +128,44 @@ def copy_to_system_clipboard(text: str, app: App) -> str:
 
 @dataclass(frozen=True)
 class PendingOperation:
-    """An operation waiting for explicit confirmation."""
+    """One or more filesystem operations awaiting confirmation."""
 
     operation: str
-    source: Path
-    destination: Path
+    sources: tuple[Path, ...]
+    destinations: tuple[Path, ...]
+
+
+
+def normalize_selected_entries(
+    entries: list[FileEntry],
+) -> tuple[Path, ...]:
+    """Remove duplicate paths and child entries covered by a selected folder."""
+
+    unique_paths = tuple(dict.fromkeys(entry.path for entry in entries))
+
+    selected_paths = set(unique_paths)
+
+    normalized: list[Path] = []
+
+    for path in unique_paths:
+        parent = path.parent
+        covered_by_parent = False
+
+        while parent != path:
+            if parent in selected_paths:
+                covered_by_parent = True
+                break
+
+            next_parent = parent.parent
+            if next_parent == parent:
+                break
+            parent = next_parent
+
+        if not covered_by_parent:
+            normalized.append(path)
+
+    return tuple(normalized)
+
 
 
 class SearchCompleted(Message):
@@ -171,41 +211,85 @@ class FileOperationCompleted(Message):
         self,
         request_id: int,
         operation: str,
-        source: Path,
-        destination: Path,
+        sources: tuple[Path, ...],
+        destinations: tuple[Path, ...],
+        completed_items: int,
         error: str | None = None,
     ) -> None:
         super().__init__()
 
         self.request_id = request_id
         self.operation = operation
-        self.source = source
-        self.destination = destination
+        self.sources = sources
+        self.destinations = destinations
+        self.completed_items = completed_items
+        self.total_items = len(sources)
         self.error = error
+
+
+
+class FileOperationProgress(Message):
+    """Progress update from a background file operation."""
+
+    def __init__(
+        self,
+        request_id: int,
+        operation: str,
+        progress: OperationProgress,
+        item_number: int,
+        total_items: int,
+    ) -> None:
+        super().__init__()
+
+        self.request_id = request_id
+        self.operation = operation
+        self.progress = progress
+        self.item_number = item_number
+        self.total_items = total_items
 
 
 class BrowserItem(ListItem):
     """A selectable filesystem entry."""
 
-    def __init__(self, entry: FileEntry, root: Path) -> None:
+    @property
+    def selected(self) -> bool:
+        return self._selected
+
+    @selected.setter
+    def selected(self, value: bool) -> None:
+        self._selected = value
+
+    def __init__(
+    self,
+    entry: FileEntry,
+    root: Path,
+    *,
+    selected: bool = False,
+) -> None:
         self.entry = entry
+        self.root = root
+        self._selected = selected
 
-        icon = "[DIR] " if entry.is_dir else "[FILE] "
+        label_widget = Static(self._build_label())
+        super().__init__(label_widget)
 
-        try:
-            relative = entry.path.relative_to(root)
-            parent = str(relative.parent)
+        self.label_widget = label_widget
 
-            label = (
-                f"{icon}{entry.name}"
-                if parent == "."
-                else f"{icon}{entry.name}  ({parent})"
-            )
+    def _build_label(self) -> Text:
+        marker = "[x]" if self.selected else "[ ]"
+        icon = "📁" if self.entry.path.is_dir() else "📄"
 
-        except ValueError:
-            label = f"{icon}{entry.name}"
+        return Text(f"{marker} {icon} {self.entry.name}")
 
-        super().__init__(Static(Text(label)))
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+
+        if self.is_mounted:
+            self.label_widget.update(self._build_label())
+
+    def on_mount(self) -> None:
+        self.label_widget.update(self._build_label())
+
 
 
 class PreviewPane(VerticalScroll):
@@ -239,6 +323,7 @@ class PotatoApp(App):
         ("m", "begin_move", "Move item"),
         ("r", "begin_rename", "Rename item"),
         ("p", "copy_current_directory", "Copy path"),
+        ("space", "toggle_selection", "Mark item"),
     ]
 
     CSS = """
@@ -284,7 +369,13 @@ class PotatoApp(App):
         height: auto;
     }
 
-    
+    #operation-progress {
+        height: 2;
+        padding: 0 1;
+        display: none;
+        background: $panel;
+    }
+
     #help {
        width: 100%;
        height: 4;
@@ -311,6 +402,8 @@ class PotatoApp(App):
         self.sort_by = "name"
 
         self._entries: list[FileEntry] = []
+        self._visible_entries: list[FileEntry] = []
+        self._selected_paths: set[Path] = set()
 
         # Search state.
         self._search_request_id = 0
@@ -326,14 +419,15 @@ class PotatoApp(App):
 
         # File-operation state.
         self._input_mode: str | None = None
-        self._pending_source: Path | None = None
+        self._pending_sources: tuple[Path, ...] = ()
         self._pending_operation: PendingOperation | None = None
 
         self._operation_request_id = 0
         self._operation_busy = False
+        self._operation_cancel_event: Event | None = None
 
-    
-    
+
+
     def compose(self) -> ComposeResult:
         yield Static("", id="status")
 
@@ -351,11 +445,13 @@ class PotatoApp(App):
                     id="preview-content",
                 )
 
+        yield Static("", id="operation-progress")
+
         yield Static(
-            "NAV: ↑/↓ Select | Enter Open | Backspace Parent | Tab Preview\n"
-            "SEARCH: F1 Here | F2 All | Esc Cancel\n"
-            "FILES: C/F6 Copy | M/F7 Move | R/F8 Rename | P/F5 Copy path\n"
-            "VIEW: F3 Hidden | F4 Sort | Ctrl+Q Quit",
+            "NAV: ↑/↓ Select | Space Mark | Enter Open | Backspace Parent | Tab Preview"
+            "\nSEARCH: F1 Here | F2 All | Esc Cancel\n"
+            "FILES: F6 Copy selected | F7 Move selected | F8 Rename one | F5 Copy path"
+            "\nVIEW: F3 Hidden | F4 Sort | Ctrl+Q Quit",
             id="help",
         )
 
@@ -375,6 +471,9 @@ class PotatoApp(App):
 
         if detail:
             message += f" | {detail}"
+
+        if self._selected_paths:
+            message += f" | Selected: {len(self._selected_paths)}"
 
         self.query_one("#status", Static).update(Text(message))
 
@@ -423,10 +522,35 @@ class PotatoApp(App):
             )
             return
 
+        self._visible_entries = list(entries)
+
+        visible_paths = {
+            entry.path for entry in entries
+        }
+
+        self._selected_paths.intersection_update(visible_paths)
+
+        self._visible_entries = list(entries)
+
+        visible_paths = {
+            entry.path for entry in entries
+        }
+
+        self._selected_paths.intersection_update(visible_paths)
+
         await file_list.extend(
-            BrowserItem(entry, self.root)
+            BrowserItem(
+                entry,
+                self.root,
+                selected=entry.path in self._selected_paths,
+            )
             for entry in entries
         )
+
+        file_list.index = 0
+
+        self.update_preview(entries[0])
+        self.update_status()
 
         file_list.index = 0
         self.update_preview(entries[0])
@@ -564,7 +688,11 @@ class PotatoApp(App):
             return
 
         if mode == "rename_name":
-            source = self._pending_source
+            source = (
+                self._pending_sources[0]
+                if self._pending_sources
+                else None
+            )
 
             if source is None:
                 await self.action_cancel_search()
@@ -585,14 +713,14 @@ class PotatoApp(App):
 
             self._pending_operation = PendingOperation(
                 operation="rename",
-                source=source,
-                destination=source.parent / value,
+                sources=(source,),
+                destinations=(source.parent / value,),
             )
 
             self._show_operation_confirmation()
             return
 
-        
+
         if mode == "confirm_operation":
             pending = self._pending_operation
 
@@ -602,7 +730,7 @@ class PotatoApp(App):
 
             # Enter confirms immediately; no text is required.
             self._input_mode = None
-            self._pending_source = None
+            self._pending_sources = ()
             self._pending_operation = None
 
             event.input.value = ""
@@ -1009,8 +1137,75 @@ class PotatoApp(App):
 
         return None
 
+    def _get_operation_sources(self) -> tuple[Path, ...]:
+        """Get marked entries or fall back to the highlighted entry."""
+
+        if self._selected_paths:
+            selected_entries = [
+                entry
+                for entry in self._visible_entries
+                if entry.path in self._selected_paths
+            ]
+        else:
+            selected = self._get_selected_entry()
+
+            selected_entries = (
+                [selected] if selected is not None else []
+            )
+
+        return normalize_selected_entries(selected_entries)
+
+    def _clear_selection(self) -> None:
+        """Clear all marked entries."""
+
+        self._selected_paths.clear()
+
+        file_list = self.query_one("#file-list", ListView)
+
+        for child in file_list.children:
+            if isinstance(child, BrowserItem):
+                child.set_selected(False)
+
+        self.update_status()
+
+    def action_toggle_selection(self) -> None:
+        """Mark or unmark the highlighted entry."""
+
+        if isinstance(self.focused, Input):
+            return
+
+        entry = self._get_selected_entry()
+
+        if entry is None:
+            return
+
+        if entry.path in self._selected_paths:
+            self._selected_paths.remove(entry.path)
+            selected = False
+        else:
+            self._selected_paths.add(entry.path)
+            selected = True
+
+        file_list = self.query_one("#file-list", ListView)
+
+        for child in file_list.children:
+            if (
+                isinstance(child, BrowserItem)
+                and child.entry.path == entry.path
+            ):
+                child.set_selected(selected)
+                break
+
+        self.update_status()
+
+        self.notify(
+            f"{len(self._selected_paths)} item(s) selected.",
+            timeout=1,
+        )
+
+
     def _begin_file_operation(self, operation: str) -> None:
-        """Begin copying, moving, or renaming the selected entry."""
+        """Begin copying, moving, or renaming selected entries."""
 
         if isinstance(self.focused, Input):
             return
@@ -1022,23 +1217,31 @@ class PotatoApp(App):
             )
             return
 
-        entry = self._get_selected_entry()
+        sources = self._get_operation_sources()
 
-        if entry is None:
+        if not sources:
             self.notify(
-                "Select a file or folder first.",
+                "Select or mark at least one item.",
                 severity="warning",
             )
             return
 
-        if not is_within_root(entry.path, self.root):
+        if operation == "rename" and len(sources) != 1:
             self.notify(
-                "Source is outside the configured root.",
-                severity="error",
+                "Rename supports one item at a time.",
+                severity="warning",
             )
             return
 
-        self._pending_source = entry.path
+        for source in sources:
+            if not is_within_root(source, self.root):
+                self.notify(
+                    f"Source outside browsing root: {source}",
+                    severity="error",
+                )
+                return
+
+        self._pending_sources = sources
 
         if operation in {"copy", "move"}:
             self._input_mode = operation
@@ -1057,7 +1260,9 @@ class PotatoApp(App):
 
             search = self.query_one("#search", Input)
             search.value = ""
-            search.placeholder = "Enter the new filename, then press Enter."
+            search.placeholder = (
+                "Enter the new filename, then press Enter."
+            )
             search.styles.display = "block"
             search.focus()
 
@@ -1076,22 +1281,22 @@ class PotatoApp(App):
 
         self._begin_file_operation("rename")
 
+
     def _on_destination_selected(
         self,
         result: Path | ManualPathRequest | None,
     ) -> None:
-        """Receive a destination chosen by the folder picker."""
+        """Receive the destination selected by the folder picker."""
 
-        source = self._pending_source
         operation = self._input_mode
 
-        if source is None or operation not in {"copy", "move"}:
-            self._pending_source = None
+        if not self._pending_sources or operation not in {"copy", "move"}:
+            self._pending_sources = ()
             self._input_mode = None
             return
 
         if result is None:
-            self._pending_source = None
+            self._pending_sources = ()
             self._input_mode = None
 
             self.notify(
@@ -1106,21 +1311,17 @@ class PotatoApp(App):
             search = self.query_one("#search", Input)
             search.value = ""
             search.placeholder = (
-                "Enter an existing destination directory path, then Enter."
+                "Enter an existing destination directory path."
             )
             search.styles.display = "block"
             search.focus()
             return
 
-        
         try:
-            self._set_pending_destination(
-                operation,
-                result,
-            )
+            self._set_pending_destination(operation, result)
 
         except (OSError, RuntimeError, ValueError) as error:
-            self._pending_source = None
+            self._pending_sources = ()
             self._pending_operation = None
             self._input_mode = None
 
@@ -1130,18 +1331,17 @@ class PotatoApp(App):
                 timeout=5,
             )
 
-
     def _set_pending_destination(
         self,
         operation: str,
         destination_directory: Path,
     ) -> None:
-        """Validate a destination directory and prepare confirmation."""
+        """Validate one destination directory for all selected sources."""
 
-        source = self._pending_source
+        sources = self._pending_sources
 
-        if source is None:
-            raise RuntimeError("No source item is selected.")
+        if not sources:
+            raise RuntimeError("No source items are selected.")
 
         destination_directory = destination_directory.resolve(
             strict=True
@@ -1155,50 +1355,88 @@ class PotatoApp(App):
         if not destination_directory.is_dir():
             raise NotADirectoryError(destination_directory)
 
-        destination = destination_directory / source.name
+        destinations = tuple(
+            destination_directory / source.name
+            for source in sources
+        )
 
-        if (
-            destination.resolve(strict=False)
-            == source.resolve(strict=True)
-        ):
-            raise ValueError(
-                "Source and destination are the same."
+        names = [destination.name for destination in destinations]
+
+        if len(names) != len(set(names)):
+            raise FileExistsError(
+                "Selected items contain duplicate names. "
+                "Choose items with unique names for this destination."
             )
+
+        for source, destination in zip(
+            sources,
+            destinations,
+            strict=True,
+        ):
+            resolved_source = source.resolve(strict=True)
+
+            if destination.resolve(strict=False) == resolved_source:
+                raise ValueError(
+                    f"Source and destination are the same: {source.name}"
+                )
+
+            if os.path.lexists(destination):
+                raise FileExistsError(
+                    f"Destination already exists: {destination}"
+                )
+
+            if source.is_dir() and destination.is_relative_to(source):
+                raise ValueError(
+                    f"Cannot copy or move a directory into itself: "
+                    f"{source.name}"
+                )
 
         self._pending_operation = PendingOperation(
             operation=operation,
-            source=source,
-            destination=destination,
+            sources=sources,
+            destinations=destinations,
         )
 
         self._show_operation_confirmation()
 
-    
     def _show_operation_confirmation(self) -> None:
-        """Ask for confirmation before executing an operation."""
+        """Ask for confirmation before executing the operation."""
 
         pending = self._pending_operation
 
         if pending is None:
             return
 
+        count = len(pending.sources)
+
+        names = ", ".join(
+            source.name for source in pending.sources[:3]
+        )
+
+        if count > 3:
+            names += f", and {count - 3} more"
+
+        if pending.operation == "rename":
+            target = str(pending.destinations[0])
+        else:
+            target = str(pending.destinations[0].parent)
+
         self._input_mode = "confirm_operation"
 
         search = self.query_one("#search", Input)
-
         search.value = ""
         search.placeholder = (
-            f"{pending.operation.upper()}: "
-            f"{pending.source.name} → {pending.destination}\n"
+            f"{pending.operation.upper()} {count} item(s): "
+            f"{names} → {target}. "
             "Press ENTER to confirm or ESC to cancel."
         )
-
         search.styles.display = "block"
         search.focus()
 
     # ---------------------------------------------------------
     # File operation execution
     # ---------------------------------------------------------
+
 
     def _start_file_operation(
         self,
@@ -1207,9 +1445,22 @@ class PotatoApp(App):
         """Start the confirmed operation in a background worker."""
 
         self._operation_request_id += 1
-
         request_id = self._operation_request_id
+
+        cancel_event = Event()
+
+        self._operation_cancel_event = cancel_event
         self._operation_busy = True
+
+        progress_widget = self.query_one(
+            "#operation-progress",
+            Static,
+        )
+
+        progress_widget.styles.display = "block"
+        progress_widget.update(
+            Text(f"{pending.operation.upper()} preparing...")
+        )
 
         self.update_status(
             f"{pending.operation.capitalize()} in progress..."
@@ -1219,6 +1470,7 @@ class PotatoApp(App):
             request_id,
             pending,
             self.root,
+            cancel_event,
         )
 
     @work(
@@ -1231,47 +1483,191 @@ class PotatoApp(App):
         request_id: int,
         pending: PendingOperation,
         root: Path,
+        cancel_event: Event,
     ) -> None:
-        """Run the filesystem operation without blocking the interface."""
+        """Execute selected operations and aggregate progress."""
+
+        completed_items = 0
+        completed_bytes = 0
+        total_items = len(pending.sources)
 
         try:
-            if pending.operation == "copy":
-                copy_path(
-                    pending.source,
-                    pending.destination,
-                    root,
-                )
+            # Calculate sizes before starting so progress has a stable total.
+            item_sizes: list[int] = []
 
-            elif pending.operation == "move":
-                move_path(
-                    pending.source,
-                    pending.destination,
-                    root,
-                )
+            for source in pending.sources:
+                if cancel_event.is_set():
+                    raise OperationCancelled("Operation cancelled.")
 
-            elif pending.operation == "rename":
-                rename_path(
-                    pending.source,
-                    pending.destination.name,
-                    root,
-                )
+                info = os.lstat(source)
 
-            else:
-                raise ValueError("Unknown file operation.")
+                if os.path.isdir(source):
+                    size_info = calculate_directory_size(
+                        source,
+                        root,
+                        cancel_event=cancel_event,
+                    )
+
+                    if size_info.errors:
+                        raise OSError(
+                            f"Cannot calculate a complete size for {source}."
+                        )
+
+                    item_sizes.append(
+                        size_info.logical_size_bytes
+                    )
+
+                else:
+                    item_sizes.append(info.st_size)
+
+            total_bytes = sum(item_sizes)
+
+            last_emit_time = 0.0
+            last_percent = -1
+            last_phase = ""
+
+            for index, (source, destination) in enumerate(
+                zip(
+                    pending.sources,
+                    pending.destinations,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                if cancel_event.is_set():
+                    raise OperationCancelled("Operation cancelled.")
+
+                item_size = item_sizes[index - 1]
+
+                def report_progress(
+                        local: OperationProgress,
+                        *,
+                        item_number: int = index,
+                        byte_offset: int = completed_bytes,
+                        current_item_size: int = item_size,
+                        completed_before: int = completed_items,
+                    ) -> None:
+                    nonlocal last_emit_time
+                    nonlocal last_percent
+                    nonlocal last_phase
+
+                    if cancel_event.is_set():
+                        return
+
+                    if pending.operation == "copy":
+                        global_bytes = (
+                            byte_offset + local.bytes_completed
+                        )
+
+                    elif local.phase == "completed":
+                        global_bytes = (
+                            byte_offset + current_item_size
+                        )
+
+                    else:
+                        global_bytes = byte_offset
+
+                    files_completed = (
+                        completed_before
+                        + (1 if local.phase == "completed" else 0)
+                    )
+
+                    aggregate_phase = local.phase
+
+                    if (
+                        local.phase == "completed"
+                        and item_number < total_items
+                    ):
+                        aggregate_phase = "copying"
+
+                    progress = OperationProgress(
+                        phase=aggregate_phase,
+                        current_path=local.current_path,
+                        bytes_completed=global_bytes,
+                        total_bytes=total_bytes,
+                        files_completed=files_completed,
+                        total_files=total_items,
+                    )
+
+                    now = time.monotonic()
+                    percent = int(progress.percentage)
+
+                    # Avoid overwhelming the UI with progress messages.
+                    if (
+                        percent == last_percent
+                        and local.phase == last_phase
+                        and now - last_emit_time < 0.15
+                    ):
+                        return
+
+                    last_emit_time = now
+                    last_percent = percent
+                    last_phase = aggregate_phase
+
+                    message = FileOperationProgress(
+                        request_id,
+                        pending.operation,
+                        progress,
+                        item_number,
+                        total_items,
+                    )
+
+                    try:
+                        self.call_from_thread(
+                            self.post_message,
+                            message,
+                        )
+                    except RuntimeError:
+                        return
+
+                if pending.operation == "copy":
+                    copy_path(
+                        source,
+                        destination,
+                        root,
+                        progress_callback=report_progress,
+                        cancel_event=cancel_event,
+                    )
+
+                elif pending.operation == "move":
+                    move_path(
+                        source,
+                        destination,
+                        root,
+                        progress_callback=report_progress,
+                        cancel_event=cancel_event,
+                    )
+
+                elif pending.operation == "rename":
+                    rename_path(
+                        source,
+                        destination.name,
+                        root,
+                        progress_callback=report_progress,
+                        cancel_event=cancel_event,
+                    )
+
+                else:
+                    raise ValueError("Unknown file operation.")
+
+                completed_items += 1
+                completed_bytes += item_size
 
             message = FileOperationCompleted(
                 request_id,
                 pending.operation,
-                pending.source,
-                pending.destination,
+                pending.sources,
+                pending.destinations,
+                completed_items,
             )
 
         except Exception as error:
             message = FileOperationCompleted(
                 request_id,
                 pending.operation,
-                pending.source,
-                pending.destination,
+                pending.sources,
+                pending.destinations,
+                completed_items,
                 str(error),
             )
 
@@ -1283,33 +1679,80 @@ class PotatoApp(App):
         except RuntimeError:
             return
 
+    def on_file_operation_progress(
+        self,
+        event: FileOperationProgress,
+    ) -> None:
+        """Display throttled background operation progress."""
+
+        if event.request_id != self._operation_request_id:
+            return
+
+        progress = event.progress
+        percentage = progress.percentage
+
+        width = 24
+        filled = round(width * percentage / 100)
+
+        bar = (
+            "█" * filled
+            + "░" * (width - filled)
+        )
+
+        detail = (
+            f"{event.operation.upper()} [{bar}] "
+            f"{percentage:5.1f}% | "
+            f"Item {event.item_number}/{event.total_items} | "
+            f"{progress.current_path.name}"
+        )
+
+        self.query_one(
+            "#operation-progress",
+            Static,
+        ).update(Text(detail))
+
     async def on_file_operation_completed(
         self,
         event: FileOperationCompleted,
     ) -> None:
-        """Display operation result and refresh the browser."""
+        """Report the result and refresh the browser."""
 
         if event.request_id != self._operation_request_id:
             return
 
         self._operation_busy = False
+        self._operation_cancel_event = None
+        self._pending_sources = ()
+        self._pending_operation = None
+
+        progress_widget = self.query_one(
+            "#operation-progress",
+            Static,
+        )
+
+        progress_widget.styles.display = "none"
+        progress_widget.update("")
+
+        self._clear_selection()
 
         if event.error:
             self.notify(
-                f"{event.operation.capitalize()} failed: {event.error}",
+                f"{event.completed_items}/{event.total_items} item(s) "
+                f"completed before stopping: {event.error}",
                 severity="error",
-                timeout=6,
+                timeout=8,
             )
 
         else:
             self.notify(
                 f"{event.operation.capitalize()} completed: "
-                f"{event.destination.name}",
+                f"{event.completed_items} item(s).",
                 severity="information",
                 timeout=4,
             )
 
         await self.refresh_directory()
+
         self.query_one("#file-list", ListView).focus()
 
     # ---------------------------------------------------------
@@ -1340,13 +1783,14 @@ class PotatoApp(App):
         self._invalidate_search()
         self._last_search_query = ""
 
-        self._pending_source = None
+        self._pending_sources = ()
         self._pending_operation = None
         self._input_mode = None
 
         search = self.query_one("#search", Input)
         search.value = ""
         search.styles.display = "none"
+        self._clear_selection()
 
         try:
             self.current = entry.path.resolve(strict=True)
@@ -1380,6 +1824,7 @@ class PotatoApp(App):
         search = self.query_one("#search", Input)
         search.value = ""
         search.styles.display = "none"
+        self._clear_selection()
 
         self.current = parent
 
@@ -1393,10 +1838,23 @@ class PotatoApp(App):
     async def action_cancel_search(self) -> None:
         """Cancel searching or an operation prompt."""
 
+        if (
+            self._operation_busy
+            and self._operation_cancel_event is not None
+        ):
+            self._operation_cancel_event.set()
+
+            self.notify(
+                "Cancellation requested. Stopping the current operation...",
+                severity="warning",
+                timeout=3,
+            )
+            return
+
         self._invalidate_search()
         self._last_search_query = ""
 
-        self._pending_source = None
+        self._pending_sources = ()
         self._pending_operation = None
         self._input_mode = None
 

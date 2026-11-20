@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -14,6 +15,11 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.widgets import Input, ListItem, ListView, Static
 
+from potato.destination_picker import (
+    DirectoryPicker,
+    ManualPathRequest,
+)
+from potato.operations import copy_path, move_path, rename_path
 from potato.security import (
     DirectorySize,
     FileEntry,
@@ -113,8 +119,17 @@ def copy_to_system_clipboard(text: str, app: App) -> str:
     )
 
 
+@dataclass(frozen=True)
+class PendingOperation:
+    """An operation waiting for explicit confirmation."""
+
+    operation: str
+    source: Path
+    destination: Path
+
+
 class SearchCompleted(Message):
-    """Message carrying the result of a background search."""
+    """Message carrying background search results."""
 
     def __init__(
         self,
@@ -132,7 +147,7 @@ class SearchCompleted(Message):
 
 
 class DirectorySizeCompleted(Message):
-    """Message carrying a background directory-size calculation."""
+    """Message carrying a directory-size result."""
 
     def __init__(
         self,
@@ -146,6 +161,26 @@ class DirectorySizeCompleted(Message):
         self.request_id = request_id
         self.path = path
         self.result = result
+        self.error = error
+
+
+class FileOperationCompleted(Message):
+    """Message carrying the result of a file operation."""
+
+    def __init__(
+        self,
+        request_id: int,
+        operation: str,
+        source: Path,
+        destination: Path,
+        error: str | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.request_id = request_id
+        self.operation = operation
+        self.source = source
+        self.destination = destination
         self.error = error
 
 
@@ -189,13 +224,21 @@ class PotatoApp(App):
 
     BINDINGS = [
         ("ctrl+q", "quit", "Quit"),
-        ("ctrl+f", "focus_search", "Search here"),
-        ("ctrl+shift+f", "global_search", "Search all"),
-        ("escape", "cancel_search", "Cancel search"),
+        ("f1", "focus_search", "Search here"),
+        ("f2", "global_search", "Search all"),
+        ("escape", "cancel_search", "Cancel / Back"),
         ("backspace", "go_parent", "Parent"),
-        ("f2", "toggle_hidden", "Hidden"),
-        ("f3", "cycle_sort", "Sort"),
+        ("f3", "toggle_hidden", "Hidden"),
+        ("f4", "cycle_sort", "Sort"),
         ("f5", "copy_current_directory", "Copy path"),
+        ("f6", "begin_copy", "Copy item"),
+        ("f7", "begin_move", "Move item"),
+        ("f8", "begin_rename", "Rename item"),
+        # Alternative keys when a terminal captures F-keys.
+        ("c", "begin_copy", "Copy item"),
+        ("m", "begin_move", "Move item"),
+        ("r", "begin_rename", "Rename item"),
+        ("p", "copy_current_directory", "Copy path"),
     ]
 
     CSS = """
@@ -241,10 +284,20 @@ class PotatoApp(App):
         height: auto;
     }
 
+    
     #help {
-        height: 2;
+       width: 100%;
+       height: 4;
+       min-height: 4;
+       background: $panel;
+    }
+
+    .help-group {
+        width: 100%;
+        min-width: 16;
+        height: 5;
         padding: 0 1;
-        background: $panel;
+        border: round $primary;
     }
     """
 
@@ -266,18 +319,26 @@ class PotatoApp(App):
         self._last_search_query = ""
         self._last_search_base = self.current
 
-        # Directory-size worker state.
+        # Directory-size state.
         self._directory_size_request_id = 0
         self._directory_size_cancel_event: Event | None = None
         self._previewed_entry: FileEntry | None = None
 
+        # File-operation state.
+        self._input_mode: str | None = None
+        self._pending_source: Path | None = None
+        self._pending_operation: PendingOperation | None = None
+
+        self._operation_request_id = 0
+        self._operation_busy = False
+
+    
+    
     def compose(self) -> ComposeResult:
         yield Static("", id="status")
 
         yield Input(
-            placeholder=(
-                "Enter a filename fragment, then press Enter to search."
-            ),
+            placeholder="Enter a filename or operation value.",
             id="search",
         )
 
@@ -291,9 +352,10 @@ class PotatoApp(App):
                 )
 
         yield Static(
-            "↑↓ Navigate | Enter Open | Backspace Parent | "
-            "Tab Preview | Ctrl+F Search here | Ctrl+Shift+F Search all | "
-            "F2 Hidden | F3 Sort | F5 Copy path | Ctrl+Q Quit",
+            "NAV: ↑/↓ Select | Enter Open | Backspace Parent | Tab Preview\n"
+            "SEARCH: F1 Here | F2 All | Esc Cancel\n"
+            "FILES: C/F6 Copy | M/F7 Move | R/F8 Rename | P/F5 Copy path\n"
+            "VIEW: F3 Hidden | F4 Sort | Ctrl+Q Quit",
             id="help",
         )
 
@@ -302,7 +364,7 @@ class PotatoApp(App):
         self.query_one("#file-list", ListView).focus()
 
     def update_status(self, detail: str = "") -> None:
-        """Render the current location and browsing options."""
+        """Display current directory and browsing settings."""
 
         hidden = "ON" if self.include_hidden else "OFF"
 
@@ -361,12 +423,10 @@ class PotatoApp(App):
             )
             return
 
-        items = [
+        await file_list.extend(
             BrowserItem(entry, self.root)
             for entry in entries
-        ]
-
-        await file_list.extend(items)
+        )
 
         file_list.index = 0
         self.update_preview(entries[0])
@@ -376,7 +436,7 @@ class PotatoApp(App):
     # ---------------------------------------------------------
 
     def _invalidate_search(self) -> None:
-        """Invalidate and cooperatively stop the previous search."""
+        """Stop and invalidate the previous search."""
 
         self._search_request_id += 1
 
@@ -397,7 +457,6 @@ class PotatoApp(App):
         cancel_event = Event()
 
         self._search_cancel_event = cancel_event
-
         self._last_search_query = query
         self._last_search_base = search_base
 
@@ -418,29 +477,29 @@ class PotatoApp(App):
         )
 
     def action_focus_search(self) -> None:
-        """Open a search scoped to the current directory."""
+        """Search the current directory tree."""
 
         self.search_all = False
+        self._input_mode = "search"
 
         search = self.query_one("#search", Input)
         search.placeholder = (
-            "Search this directory and its subdirectories; press Enter."
+            "Search current directory and subdirectories; press Enter."
         )
-
         search.value = ""
         search.styles.display = "block"
         search.focus()
 
     def action_global_search(self) -> None:
-        """Open a search scoped to the configured root."""
+        """Search the entire configured root."""
 
         self.search_all = True
+        self._input_mode = "search"
 
         search = self.query_one("#search", Input)
         search.placeholder = (
             "Search the entire Potato root; press Enter."
         )
-
         search.value = ""
         search.styles.display = "block"
         search.focus()
@@ -449,41 +508,111 @@ class PotatoApp(App):
         self,
         event: Input.Submitted,
     ) -> None:
-        """Run a search only after Enter is pressed."""
+        """Handle search, destination path, rename, and confirmation."""
 
         if event.input.id != "search":
             return
 
-        query = event.value.strip()
+        value = event.value.strip()
+        mode = self._input_mode
 
-        if not query:
-            await self.action_cancel_search()
+        if mode == "search":
+            if not value:
+                await self.action_cancel_search()
+                return
+
+            search_base = (
+                self.root
+                if self.search_all
+                else self.current
+            )
+
+            event.input.styles.display = "none"
+            self._input_mode = None
+
+            self.query_one("#file-list", ListView).focus()
+            self._start_search(value, search_base)
             return
 
-        search_base = (
-            self.root
-            if self.search_all
-            else self.current
-        )
+        if mode in {"copy_path", "move_path"}:
+            operation = mode.removesuffix("_path")
 
-        event.input.styles.display = "none"
-        self.query_one("#file-list", ListView).focus()
+            try:
+                destination_directory = Path(value).expanduser()
 
-        self._start_search(query, search_base)
+                if not destination_directory.is_absolute():
+                    destination_directory = (
+                        self.current / destination_directory
+                    )
 
-    async def action_cancel_search(self) -> None:
-        """Cancel search and restore the directory listing."""
+                destination_directory = (
+                    destination_directory.resolve(strict=True)
+                )
 
-        self._invalidate_search()
-        self._last_search_query = ""
+                self._set_pending_destination(
+                    operation,
+                    destination_directory,
+                )
 
-        search = self.query_one("#search", Input)
-        search.value = ""
-        search.styles.display = "none"
+            except (OSError, RuntimeError, ValueError) as error:
+                self.notify(
+                    f"Invalid destination: {error}",
+                    severity="error",
+                    timeout=5,
+                )
 
-        await self.refresh_directory()
+            return
 
-        self.query_one("#file-list", ListView).focus()
+        if mode == "rename_name":
+            source = self._pending_source
+
+            if source is None:
+                await self.action_cancel_search()
+                return
+
+            if (
+                not value
+                or value in {".", ".."}
+                or "/" in value
+                or "\x00" in value
+                or (os.altsep is not None and os.altsep in value)
+            ):
+                self.notify(
+                    "Invalid filename.",
+                    severity="error",
+                )
+                return
+
+            self._pending_operation = PendingOperation(
+                operation="rename",
+                source=source,
+                destination=source.parent / value,
+            )
+
+            self._show_operation_confirmation()
+            return
+
+        
+        if mode == "confirm_operation":
+            pending = self._pending_operation
+
+            if pending is None:
+                await self.action_cancel_search()
+                return
+
+            # Enter confirms immediately; no text is required.
+            self._input_mode = None
+            self._pending_source = None
+            self._pending_operation = None
+
+            event.input.value = ""
+            event.input.styles.display = "none"
+
+            self.query_one("#file-list", ListView).focus()
+
+            self._start_file_operation(pending)
+            return
+
 
     @work(
         thread=True,
@@ -500,7 +629,7 @@ class PotatoApp(App):
         request_id: int,
         cancel_event: Event,
     ) -> None:
-        """Search without blocking the terminal interface."""
+        """Search without blocking the interface."""
 
         try:
             results = search_files(
@@ -538,7 +667,6 @@ class PotatoApp(App):
                 self.post_message,
                 message,
             )
-
         except RuntimeError:
             return
 
@@ -546,7 +674,7 @@ class PotatoApp(App):
         self,
         event: SearchCompleted,
     ) -> None:
-        """Display only the latest search results."""
+        """Display only the latest search result."""
 
         if event.request_id != self._search_request_id:
             return
@@ -567,11 +695,11 @@ class PotatoApp(App):
         await self.render_entries(event.results)
 
     # ---------------------------------------------------------
-    # Directory-size calculation
+    # Directory size
     # ---------------------------------------------------------
 
     def _cancel_directory_size(self) -> None:
-        """Stop an obsolete directory-size calculation."""
+        """Cancel an obsolete size calculation."""
 
         self._directory_size_request_id += 1
 
@@ -580,7 +708,7 @@ class PotatoApp(App):
             self._directory_size_cancel_event = None
 
     def _start_directory_size(self, path: Path) -> None:
-        """Start calculating the selected directory's contents."""
+        """Start background directory-size calculation."""
 
         request_id = self._directory_size_request_id
         cancel_event = Event()
@@ -640,7 +768,6 @@ class PotatoApp(App):
                 self.post_message,
                 message,
             )
-
         except RuntimeError:
             return
 
@@ -648,7 +775,7 @@ class PotatoApp(App):
         self,
         event: DirectorySizeCompleted,
     ) -> None:
-        """Update the preview when its directory calculation finishes."""
+        """Display completed directory-size information."""
 
         if event.request_id != self._directory_size_request_id:
             return
@@ -669,7 +796,7 @@ class PotatoApp(App):
         )
 
     # ---------------------------------------------------------
-    # Preview
+    # File preview and metadata
     # ---------------------------------------------------------
 
     def on_list_view_highlighted(
@@ -689,7 +816,7 @@ class PotatoApp(App):
         directory_error: str | None = None,
         calculate_directory: bool = True,
     ) -> None:
-        """Display accurate size, permissions, and file contents."""
+        """Display size, permissions, and file contents."""
 
         self._cancel_directory_size()
         self._previewed_entry = entry
@@ -751,9 +878,8 @@ class PotatoApp(App):
 
                     if directory_size.errors:
                         details.append(
-                            "Warning: "
-                            f"{directory_size.errors} item(s) could not "
-                            "be inspected. The total is incomplete."
+                            f"Warning: {directory_size.errors} item(s) "
+                            "could not be inspected. Total is incomplete."
                         )
 
                 elif directory_error:
@@ -768,12 +894,11 @@ class PotatoApp(App):
                         "",
                         "DIRECTORY CONTENTS",
                         "Calculating directory contents...",
-                        "This calculation runs in the background.",
                     ])
 
             else:
                 details.extend([
-                    f"Logical file size: "
+                    "Logical file size: "
                     f"{format_bytes(metadata.logical_size_bytes)}",
                     (
                         "Allocated on disk: "
@@ -808,7 +933,7 @@ class PotatoApp(App):
                     f"{'Yes' if metadata.can_execute else 'No'}"
                 ),
                 "",
-                "Access checks are advisory and do not guarantee a later operation.",
+                "Access checks are advisory.",
             ])
 
         except (OSError, RuntimeError, ValueError) as error:
@@ -850,7 +975,6 @@ class PotatoApp(App):
 
         self.query_one("#preview-pane", PreviewPane).scroll_y = 0
 
-        # Calculate the total contents asynchronously.
         if (
             entry.is_dir
             and directory_size is None
@@ -858,6 +982,335 @@ class PotatoApp(App):
             and calculate_directory
         ):
             self._start_directory_size(entry.path)
+
+    # ---------------------------------------------------------
+    # File operation selection
+    # ---------------------------------------------------------
+
+    def _get_selected_entry(self) -> FileEntry | None:
+        """Return the highlighted file or directory."""
+
+        file_list = self.query_one("#file-list", ListView)
+
+        index = file_list.index
+
+        if index is None:
+            return None
+
+        children = list(file_list.children)
+
+        if index < 0 or index >= len(children):
+            return None
+
+        selected = children[index]
+
+        if isinstance(selected, BrowserItem):
+            return selected.entry
+
+        return None
+
+    def _begin_file_operation(self, operation: str) -> None:
+        """Begin copying, moving, or renaming the selected entry."""
+
+        if isinstance(self.focused, Input):
+            return
+
+        if self._operation_busy:
+            self.notify(
+                "Another file operation is running.",
+                severity="warning",
+            )
+            return
+
+        entry = self._get_selected_entry()
+
+        if entry is None:
+            self.notify(
+                "Select a file or folder first.",
+                severity="warning",
+            )
+            return
+
+        if not is_within_root(entry.path, self.root):
+            self.notify(
+                "Source is outside the configured root.",
+                severity="error",
+            )
+            return
+
+        self._pending_source = entry.path
+
+        if operation in {"copy", "move"}:
+            self._input_mode = operation
+
+            self.push_screen(
+                DirectoryPicker(
+                    self.root,
+                    self.current,
+                ),
+                self._on_destination_selected,
+            )
+            return
+
+        if operation == "rename":
+            self._input_mode = "rename_name"
+
+            search = self.query_one("#search", Input)
+            search.value = ""
+            search.placeholder = "Enter the new filename, then press Enter."
+            search.styles.display = "block"
+            search.focus()
+
+    def action_begin_copy(self) -> None:
+        """Copy the selected entry."""
+
+        self._begin_file_operation("copy")
+
+    def action_begin_move(self) -> None:
+        """Move the selected entry."""
+
+        self._begin_file_operation("move")
+
+    def action_begin_rename(self) -> None:
+        """Rename the selected entry."""
+
+        self._begin_file_operation("rename")
+
+    def _on_destination_selected(
+        self,
+        result: Path | ManualPathRequest | None,
+    ) -> None:
+        """Receive a destination chosen by the folder picker."""
+
+        source = self._pending_source
+        operation = self._input_mode
+
+        if source is None or operation not in {"copy", "move"}:
+            self._pending_source = None
+            self._input_mode = None
+            return
+
+        if result is None:
+            self._pending_source = None
+            self._input_mode = None
+
+            self.notify(
+                "Destination selection cancelled.",
+                timeout=2,
+            )
+            return
+
+        if isinstance(result, ManualPathRequest):
+            self._input_mode = f"{operation}_path"
+
+            search = self.query_one("#search", Input)
+            search.value = ""
+            search.placeholder = (
+                "Enter an existing destination directory path, then Enter."
+            )
+            search.styles.display = "block"
+            search.focus()
+            return
+
+        
+        try:
+            self._set_pending_destination(
+                operation,
+                result,
+            )
+
+        except (OSError, RuntimeError, ValueError) as error:
+            self._pending_source = None
+            self._pending_operation = None
+            self._input_mode = None
+
+            self.notify(
+                f"Invalid destination: {error}",
+                severity="error",
+                timeout=5,
+            )
+
+
+    def _set_pending_destination(
+        self,
+        operation: str,
+        destination_directory: Path,
+    ) -> None:
+        """Validate a destination directory and prepare confirmation."""
+
+        source = self._pending_source
+
+        if source is None:
+            raise RuntimeError("No source item is selected.")
+
+        destination_directory = destination_directory.resolve(
+            strict=True
+        )
+
+        if not destination_directory.is_relative_to(self.root):
+            raise PermissionError(
+                "Destination is outside the configured root."
+            )
+
+        if not destination_directory.is_dir():
+            raise NotADirectoryError(destination_directory)
+
+        destination = destination_directory / source.name
+
+        if (
+            destination.resolve(strict=False)
+            == source.resolve(strict=True)
+        ):
+            raise ValueError(
+                "Source and destination are the same."
+            )
+
+        self._pending_operation = PendingOperation(
+            operation=operation,
+            source=source,
+            destination=destination,
+        )
+
+        self._show_operation_confirmation()
+
+    
+    def _show_operation_confirmation(self) -> None:
+        """Ask for confirmation before executing an operation."""
+
+        pending = self._pending_operation
+
+        if pending is None:
+            return
+
+        self._input_mode = "confirm_operation"
+
+        search = self.query_one("#search", Input)
+
+        search.value = ""
+        search.placeholder = (
+            f"{pending.operation.upper()}: "
+            f"{pending.source.name} → {pending.destination}\n"
+            "Press ENTER to confirm or ESC to cancel."
+        )
+
+        search.styles.display = "block"
+        search.focus()
+
+    # ---------------------------------------------------------
+    # File operation execution
+    # ---------------------------------------------------------
+
+    def _start_file_operation(
+        self,
+        pending: PendingOperation,
+    ) -> None:
+        """Start the confirmed operation in a background worker."""
+
+        self._operation_request_id += 1
+
+        request_id = self._operation_request_id
+        self._operation_busy = True
+
+        self.update_status(
+            f"{pending.operation.capitalize()} in progress..."
+        )
+
+        self.run_file_operation_worker(
+            request_id,
+            pending,
+            self.root,
+        )
+
+    @work(
+        thread=True,
+        group="file-operation",
+        exit_on_error=False,
+    )
+    def run_file_operation_worker(
+        self,
+        request_id: int,
+        pending: PendingOperation,
+        root: Path,
+    ) -> None:
+        """Run the filesystem operation without blocking the interface."""
+
+        try:
+            if pending.operation == "copy":
+                copy_path(
+                    pending.source,
+                    pending.destination,
+                    root,
+                )
+
+            elif pending.operation == "move":
+                move_path(
+                    pending.source,
+                    pending.destination,
+                    root,
+                )
+
+            elif pending.operation == "rename":
+                rename_path(
+                    pending.source,
+                    pending.destination.name,
+                    root,
+                )
+
+            else:
+                raise ValueError("Unknown file operation.")
+
+            message = FileOperationCompleted(
+                request_id,
+                pending.operation,
+                pending.source,
+                pending.destination,
+            )
+
+        except Exception as error:
+            message = FileOperationCompleted(
+                request_id,
+                pending.operation,
+                pending.source,
+                pending.destination,
+                str(error),
+            )
+
+        try:
+            self.call_from_thread(
+                self.post_message,
+                message,
+            )
+        except RuntimeError:
+            return
+
+    async def on_file_operation_completed(
+        self,
+        event: FileOperationCompleted,
+    ) -> None:
+        """Display operation result and refresh the browser."""
+
+        if event.request_id != self._operation_request_id:
+            return
+
+        self._operation_busy = False
+
+        if event.error:
+            self.notify(
+                f"{event.operation.capitalize()} failed: {event.error}",
+                severity="error",
+                timeout=6,
+            )
+
+        else:
+            self.notify(
+                f"{event.operation.capitalize()} completed: "
+                f"{event.destination.name}",
+                severity="information",
+                timeout=4,
+            )
+
+        await self.refresh_directory()
+        self.query_one("#file-list", ListView).focus()
 
     # ---------------------------------------------------------
     # Navigation
@@ -887,14 +1340,16 @@ class PotatoApp(App):
         self._invalidate_search()
         self._last_search_query = ""
 
-        search = self.query_one("#search", Input)
+        self._pending_source = None
+        self._pending_operation = None
+        self._input_mode = None
 
+        search = self.query_one("#search", Input)
         search.value = ""
         search.styles.display = "none"
 
         try:
             self.current = entry.path.resolve(strict=True)
-
         except (OSError, RuntimeError) as error:
             self.notify(
                 f"Unable to open directory: {error}",
@@ -903,11 +1358,10 @@ class PotatoApp(App):
             return
 
         await self.refresh_directory()
-
         self.query_one("#file-list", ListView).focus()
 
     async def action_go_parent(self) -> None:
-        """Navigate to the parent without leaving the browsing root."""
+        """Go to the parent without leaving the configured root."""
 
         if isinstance(self.focused, Input):
             return
@@ -924,22 +1378,37 @@ class PotatoApp(App):
         self._last_search_query = ""
 
         search = self.query_one("#search", Input)
-
         search.value = ""
         search.styles.display = "none"
 
         self.current = parent
 
         await self.refresh_directory()
-
         self.query_one("#file-list", ListView).focus()
 
     # ---------------------------------------------------------
     # Keyboard actions
     # ---------------------------------------------------------
 
+    async def action_cancel_search(self) -> None:
+        """Cancel searching or an operation prompt."""
+
+        self._invalidate_search()
+        self._last_search_query = ""
+
+        self._pending_source = None
+        self._pending_operation = None
+        self._input_mode = None
+
+        search = self.query_one("#search", Input)
+        search.value = ""
+        search.styles.display = "none"
+
+        await self.refresh_directory()
+        self.query_one("#file-list", ListView).focus()
+
     async def action_toggle_hidden(self) -> None:
-        """Toggle hidden entries and refresh the current view."""
+        """Toggle visibility of hidden entries."""
 
         if isinstance(self.focused, Input):
             return
@@ -960,7 +1429,7 @@ class PotatoApp(App):
         )
 
     async def action_cycle_sort(self) -> None:
-        """Cycle sorting by name, size, and modification date."""
+        """Cycle between name, size, and modified-date sorting."""
 
         if isinstance(self.focused, Input):
             return

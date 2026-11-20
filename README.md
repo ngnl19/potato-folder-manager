@@ -2,7 +2,7 @@
 
 **A secure, local-first, keyboard-driven terminal file manager for Ubuntu and Linux.**
 
-Potato makes navigating your filesystem easier without repeatedly typing `cd` and other shell commands. Browse directories, search for files recursively, preview file contents, and inspect file information through a simple keyboard-driven terminal interface.
+Potato makes navigating your filesystem easier without repeatedly typing `cd` and other shell commands. Browse directories, search for files recursively, preview file contents, inspect file information, and manage files through a keyboard-driven terminal interface.
 
 ## ✨ Features
 
@@ -13,6 +13,9 @@ Potato makes navigating your filesystem easier without repeatedly typing `cd` an
 - **File Information** – Inspect file sizes, types, paths, and modification dates.
 - **Hidden Files** – Toggle visibility of hidden files and directories.
 - **Sorting** – Sort files by name, size, and modification date.
+- **Multi-Selection** – Mark multiple files and directories for batch operations.
+- **Batch Copy and Move** – Copy or move multiple selected items in one operation.
+- **Operation Progress** – See progress while longer file operations are running.
 - **Copy Directory Path** – Copy the current directory path to your system clipboard.
 - **Local-First** – Designed to access your local filesystem without requiring cloud storage.
 
@@ -43,10 +46,10 @@ Open a new terminal after running this command.
 
 ### 2. Install Potato
 
-Install the latest available release:
+Install version `0.2.0`:
 
 ```bash
-pipx install "https://github.com/ngnl19/potato-folder-manager/releases/download/v0.1.0/potato_cli-0.1.0-py3-none-any.whl"
+pipx install "https://github.com/ngnl19/potato-folder-manager/releases/download/v0.2.0/potato_cli-0.2.0-py3-none-any.whl"
 ```
 
 ### 3. Verify installation
@@ -82,16 +85,22 @@ potato start -p ~/Documents
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Navigate files and directories |
-| `Enter` | Open selected directory |
-| `Backspace` | Navigate to parent directory |
+| `Enter` | Open the selected directory |
+| `Backspace` | Navigate to the parent directory |
 | `Tab` | Switch focus to the preview panel |
-| `F2` | Toggle hidden files |
-| `F3` | Change sorting method |
-| `F4` | Search current directory recursively |
-| `F5` | Search entire configured root |
-| `F6` | Copy current directory path |
-| `Esc` | Cancel search |
+| `Space` | Mark or unmark the highlighted item |
+| `F1` | Search the current directory |
+| `F2` | Search the configured root recursively |
+| `Esc` | Cancel the current action or clear selection |
+| `F3` | Toggle hidden files |
+| `F4` | Change sorting method |
+| `F5` | Copy the current directory path |
+| `F6` | Copy selected item(s) |
+| `F7` | Move selected item(s) |
+| `F8` | Rename the highlighted item |
 | `Ctrl + Q` | Exit Potato |
+
+When no items are marked, copy and move operate on the highlighted item. Marked items are shown with `[x]`; unmarked items use `[ ]`. Entries retain their type labels, for example `[ ] [DIR] Documents` and `[ ] [FILE] report.txt`.
 
 ## 🔒 Security and Privacy
 
@@ -109,7 +118,6 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/ngnl19/potato-folder-manager.git
-
 cd potato-folder-manager
 ```
 
@@ -117,7 +125,6 @@ Create and activate a virtual environment:
 
 ```bash
 python3 -m venv .venv
-
 source .venv/bin/activate
 ```
 
@@ -157,7 +164,7 @@ Download the latest version from:
 
 ## 📋 Project Status
 
-**Current version:** `0.1.0`
+**Current version:** `0.2.0`
 
 Potato is actively being developed. Features and functionality may change as the project evolves.
 

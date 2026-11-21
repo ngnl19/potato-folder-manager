@@ -46,7 +46,7 @@ Open a new terminal after running this command.
 
 ### 2. Install Potato
 
-Install version `0.2.0`:
+Install version `0.2.1`:
 
 ```bash
 pipx install "https://github.com/ngnl19/potato-folder-manager/releases/download/v0.2.1/potato_cli-0.2.1-py3-none-any.whl"
